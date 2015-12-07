@@ -1,0 +1,309 @@
+#!/usr/bin/perl
+# vi: set ts=4 sw=4 :
+
+use warnings;
+use strict;
+
+select STDERR; $| = 1;
+select STDOUT; $| = 1;
+
+use Fcntl qw( LOCK_EX O_CREAT O_RDWR );
+use GDBM_File qw( GDBM_WRCREAT );
+
+@ARGV == 3 or die "Usage: $0 lockfile dbmfile dbmtmpfile\n";
+my ($lockfile, $dbmfile, $dbmtmpfile) = @ARGV;
+
+sub withdb(&;)
+{
+	my $cb = shift;
+
+	open(my $fh, ">", $lockfile) or die $!;
+	flock($fh, LOCK_EX) or die $!;
+
+	my %db;
+	tie %db, 'GDBM_File', $dbmfile, GDBM_WRCREAT, 0600
+		or die;
+
+	my $r = &$cb(\%db, @_) if not wantarray;
+	my @r = &$cb(\%db, @_) if wantarray;
+
+	untie %db;
+
+	wantarray ? @r : $r;
+}
+
+my $verb = <STDIN>;
+defined($verb) or exit;
+chomp $verb;
+$verb =~ s/\015\z//;
+
+print STDERR "verb=$verb\n";
+
+{
+	my $c;
+	sub _read_local_domains {
+		my %d;
+		opendir(my $dh, "/usr/local/rudolf-mail/conf/domains") or die $!;
+		while (defined(my $name = readdir $dh)) {
+			next if $name =~ /\A\./;
+			$d{lc $name} = undef;
+		}
+		closedir $dh;
+		$c = \%d;
+	}
+	sub localdom($) {
+		$c ||= _read_local_domains();
+		exists $c->{lc $_[0]};
+	}
+}
+
+sub localaddr($) { $_[0] =~ /\@(.*)$/ and localdom(lc $1) }
+
+sub is_mailing_list
+{
+	local $_ = shift;
+	0
+		or /^musicbrainz-[a-z0-9]*\@lists.musicbrainz.org$/i
+		or /^exim-users\@exim.org$/i
+		or /^exim-dev\@exim.org$/i
+		or /^hosting-ftp\@osuosl.org$/i
+		or /^musicbrainz-datafeed\@lists.musicbrainz.org$/i
+		or /^nginx\@nginx.org$/i
+		or /^haproxy\@formilux.org$/i
+		;
+}
+
+sub address_maps_to_me
+{
+	my ($addr) = @_;
+	return 1 if localaddr($addr);
+	return 0;
+}
+
+if ($verb eq "add")
+{
+	eval {
+		my $info = read_parse_header();
+		my $now = time;
+
+		my @set;
+
+		withdb {
+			my $db = shift;
+
+			my $setkey = sub {
+				my ($k, $v) = @_;
+				push @set, [ $k, $v ];
+				return if $ENV{DRYRUN};
+				$db->{$k} = $v;
+			};
+
+			my $exp = $now + 86400 * 30;
+			for my $msgid (@{ $info->{msgids} })
+			{
+				$msgid or next;
+				&$setkey("msgid_$msgid", $exp);
+			}
+
+			$exp = $now + 86400 * 365;
+			for my $addr (@{ $info->{from} }, @{ $info->{to} })
+			{
+				my $k = "addr_" . lc $addr;
+				if (is_mailing_list($addr)) {
+					print STDERR "unset $k\n";
+					delete $db->{$k};
+					next;
+				}
+				next if address_maps_to_me($addr);
+				&$setkey($k, $exp);
+			}
+		};
+
+		print STDERR "set", (map { " $_->[0]=$_->[1]" } @set), "\n";
+		print "ok\n";
+	};
+	print "error\n$@\n" if $@;
+}
+elsif ($verb eq "test")
+{
+	eval {
+		my $info = read_parse_header();
+
+		my @left;
+		my $ok = 0;
+
+		withdb {
+			my $db = shift;
+
+			my $now = time;
+
+			my $try_key = sub {
+				my ($k) = @_;
+				my $exp = $db->{$k};
+				my $left = 0;
+				$left = $exp - $now if defined($exp) and $exp > $now;
+				$ok = 1 if $left > 0;
+				push @left, [$k,$left];
+			};
+
+			for my $msgid (@{ $info->{msgids} })
+			{
+				$msgid or next;
+				&$try_key("msgid_$msgid");
+			}
+
+			for my $addr (@{ $info->{from} }, @{ $info->{to} })
+			{
+				$addr or next;
+				&$try_key("addr_" . lc $addr);
+			}
+		};
+
+		my $ans = ($ok ? "white" : "neutral");
+		print STDERR $ans, (map { " $_->[0]=$_->[1]" } @left), "\n";
+		print $ans, "\n";
+	};
+	print "error\n$@\n" if $@;
+}
+elsif ($verb eq "expire")
+{
+	eval {
+		my $tot = 0;
+		my $keep = 0;
+
+		my %new;
+		tie %new, 'GDBM_File', $dbmtmpfile, GDBM_WRCREAT, 0600
+			or die $!;
+
+		withdb {
+			my $db = shift;
+			my $now = time;
+
+			while (my ($k, $exp) = each %$db)
+			{
+				++$tot;
+				++$keep, $new{$k} = $exp
+					if $exp > $now;
+			}
+		};
+
+		untie %new;
+		rename $dbmtmpfile, $dbmfile or die "rename: $!";
+
+		printf "deleted=%d kept=%d\n", $tot-$keep, $keep;
+	};
+	print "error\n$@\n" if $@;
+}
+elsif ($verb eq "delete")
+{
+	my %to_delete;
+
+	while (<STDIN>)
+	{
+		my ($exp, $k) = /^(\d+)\t(.*)$/ or next;
+		$to_delete{$k} = $exp;
+	}
+
+	eval {
+		my $deleted = 0;
+		my $kept = 0;
+
+		my %new;
+		tie %new, 'GDBM_File', $dbmtmpfile, GDBM_WRCREAT, 0600
+			or die $!;
+
+		withdb {
+			my $db = shift;
+
+			while (my ($k, $exp) = each %$db)
+			{
+				if (exists $to_delete{$k} and ($to_delete{$k} == $exp or $ENV{FORCE}))
+				{
+					++$deleted;
+					printf "deleted\t$exp\t$k\n";
+				} else {
+					++$kept;
+					$new{$k} = $exp;
+				}
+			}
+		};
+
+		untie %new;
+		rename $dbmtmpfile, $dbmfile or die "rename: $!";
+
+		printf "deleted=%d kept=%d\n", $deleted, $kept;
+	};
+	print "error\n$@\n" if $@;
+}
+elsif ($verb eq "dump")
+{
+	withdb {
+		my $db = shift;
+		while (my ($k, $exp) = each %$db)
+		{
+			print "$exp\t$k\n";
+		}
+	};
+}
+else
+{
+	print "error\nunknown command\n";
+}
+
+exit;
+
+sub read_parse_header
+{
+	my @l;
+	{
+		while (<STDIN>)
+		{
+			/\S/ or last;
+			push @l, $_;
+		}
+	}
+
+	require Mail::Header;
+	my $h = Mail::Header->new(\@l);
+
+	my %info;
+	$info{h} = $h;
+
+	my $getaddrs = sub {
+		my $tag = shift;
+		my @text = $h->get($tag)
+			or return;
+		require Mail::Address;
+		my @addrs = map { Mail::Address->parse($_) } @text;
+		return grep { not blocked_address($_) } map { $_->address } @addrs;
+	};
+
+	my $getids = sub {
+		my $tag = shift;
+		my @text = $h->get($tag)
+			or return;
+		my @ids;
+		my $t = join " ", @text;
+		return $t =~ /(<[\w.-]+\@[\w.-]+>)/ig;
+	};
+
+	$info{from} = [ map { &$getaddrs($_) } qw( From Sender ) ];
+	$info{to} = [ map { &$getaddrs($_) } qw( To Cc ) ];
+	$info{msgids} = [ map { &$getids($_) } qw( Message-Id In-Reply-To References) ];
+
+	# use Data::Dumper;
+	# print STDERR Data::Dumper->Dump([ \%info ],[ '*info' ]);
+
+	return \%info;
+}
+
+sub blocked_address
+{
+	return 1 if $_[0] !~ /\@/; # for example, "undisclosed-recipients"
+	return 1 if $_[0] =~ /\@localhost$/i;
+	return 1 if $_[0] =~ /\@localhost\.localdomain$/i;
+	# TODO may also need to blacklist (root|bounce|nobody|noreply)@(localhost|nowhere|dev.null) and so forth
+	return 0;
+}
+
+# eof handler

@@ -1,0 +1,5 @@
+#!/bin/sh
+{
+	echo test
+	cat $1
+} | `dirname $0`/handler1

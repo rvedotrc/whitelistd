@@ -1,0 +1,5 @@
+#!/usr/bin/perl -p
+# vi: set ts=4 sw=4 :
+
+use POSIX qw( strftime );
+s/(\d+)/strftime('%Y%m%d-%H%M%S-UTC', gmtime $1)/e;
